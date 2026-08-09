@@ -1,0 +1,395 @@
+# =============================================================================
+# BMO PORTAL NAVIGATION - Full logging + retry support
+# =============================================================================
+
+import time
+import os
+import logging
+from datetime import datetime
+from playwright.sync_api import Page, TimeoutError as PWTimeout
+from config import (
+    BMO_LOGIN_URL, PAGE_LOAD_WAIT_SEC,
+    ACTION_DELAY_MS, DOWNLOAD_WAIT_SEC
+)
+
+logger = logging.getLogger("BridgeBMO.Navigator")
+
+
+class BMONavigator:
+
+    def __init__(self, page: Page, download_folder: str):
+        self.page            = page
+        self.download_folder = download_folder
+        self.timeout         = PAGE_LOAD_WAIT_SEC * 1000
+        self.action_delay    = ACTION_DELAY_MS / 1000
+
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+    def _pause(self, seconds: float = None):
+        time.sleep(seconds or self.action_delay)
+
+    def _try_click(self, selectors: list,
+                   description: str,
+                   timeout: int = 5000) -> bool:
+        """Try selectors with short timeout. Fail fast."""
+        for sel in selectors:
+            try:
+                el = self.page.locator(sel).first
+                el.wait_for(timeout=timeout)
+                el.click()
+                logger.debug(
+                    f"Clicked [{description}] via: {sel}"
+                )
+                return True
+            except Exception:
+                continue
+        logger.warning(f"Could not click: {description}")
+        return False
+
+    def _try_fill(self, selector: str,
+                  value: str,
+                  description: str) -> bool:
+        """Fill input field safely."""
+        try:
+            field = self.page.locator(selector)
+            field.wait_for(timeout=self.timeout)
+            field.click()
+            field.clear()
+            field.type(value, delay=60)
+            logger.debug(f"Filled: {description}")
+            return True
+        except Exception as e:
+            logger.error(
+                f"Fill failed [{description}]: {e}"
+            )
+            return False
+
+    def _page_info(self):
+        try:
+            logger.debug(f"URL: {self.page.url}")
+            logger.debug(f"Title: {self.page.title()}")
+        except Exception:
+            pass
+
+    # =========================================================================
+    # SESSION CHECK
+    # =========================================================================
+    def is_session_alive(self) -> bool:
+        """
+        Check if BMO session is still active.
+        Returns False if redirected to login (timed out).
+        """
+        try:
+            url   = self.page.url
+            title = self.page.title()
+            if ("login" in url.lower() or
+                    "sign in" in title.lower()):
+                logger.warning(
+                    "Session expired - redirected to login"
+                )
+                return False
+            return True
+        except Exception:
+            return False
+
+    # =========================================================================
+    # LOGIN
+    # =========================================================================
+    def fill_login_form(self, nickname: str,
+                        customer_id: str,
+                        user_id: str,
+                        password: str):
+        """Navigate to BMO login and fill credentials."""
+        logger.info("Navigating to BMO login page...")
+        self.page.goto(
+            BMO_LOGIN_URL, wait_until="domcontentloaded"
+        )
+        self._pause(3)
+        self._page_info()
+
+        # Dismiss cookie popup
+        logger.info("Dismissing cookie popup...")
+        self._try_click(
+            selectors=[
+                "button.save-preference-btn-handler",
+                "button.onetrust-close-btn-handler",
+                "button:has-text('Confirm My Choices')",
+            ],
+            description="Cookie popup",
+            timeout=5000
+        )
+        self._pause(2)
+
+        # Wait for login form
+        try:
+            self.page.wait_for_selector(
+                "#customerId", timeout=10_000
+            )
+            logger.info("Login form ready")
+        except PWTimeout:
+            logger.warning(
+                "Login form timeout - continuing"
+            )
+
+        self._pause(1)
+
+        # Fill credentials
+        self._try_fill(
+            "#customerId", customer_id, "Customer ID"
+        )
+        self._pause(0.5)
+        self._try_fill(
+            "#userId", user_id, "User ID"
+        )
+        self._pause(0.5)
+        self._try_fill(
+            "#loginPassword", password, "Password"
+        )
+        self._pause(0.5)
+
+        # Sign In
+        self._try_click(
+            selectors=[
+                "button.sign-in-btn-ln",
+                "button:has-text('Sign In')",
+            ],
+            description="Sign In button",
+            timeout=5000
+        )
+        self._pause(3)
+        self._page_info()
+
+    # =========================================================================
+    # DASHBOARD
+    # =========================================================================
+    def wait_for_dashboard(self):
+        """Wait for dashboard after RSA token."""
+        logger.info("Waiting for dashboard...")
+        try:
+            self.page.wait_for_selector(
+                "text=Deposit accounts",
+                timeout=120_000
+            )
+            logger.info("Dashboard loaded ✅")
+        except PWTimeout:
+            logger.error("Dashboard timeout ❌")
+            self._page_info()
+        self._pause(2)
+
+    # =========================================================================
+    # ACCOUNT NAVIGATION
+    # =========================================================================
+    def click_account(self, account_number: str) -> bool:
+        """Click account number link on dashboard."""
+        logger.info(f"Clicking account: {account_number}")
+
+        clicked = self._try_click(
+            selectors=[
+                f"a:has-text('{account_number}')",
+                f"td:has-text('{account_number}')",
+                f"span:has-text('{account_number}')",
+                f"text={account_number}",
+            ],
+            description=f"Account {account_number}",
+            timeout=8000
+        )
+
+        if clicked:
+            self._pause(2)
+        return clicked
+
+    # =========================================================================
+    # FILTER
+    # =========================================================================
+    def apply_timeframe_filter(self, timeframe: str,
+                               custom_from: str = None,
+                               custom_to: str = None):
+        """Apply transaction date filter."""
+        logger.info(f"Applying filter: {timeframe}")
+
+        # ── Step 1: Open the filter panel ────────────────────────────────────
+        clicked = self._try_click(
+            selectors=[
+                "button.add-Filters-button",
+                "button:has-text('Modify filters')",
+            ],
+            description="Modify filters",
+            timeout=8000
+        )
+
+        if not clicked:
+            logger.error("Could not open filter panel")
+            return
+
+        self._pause(1.5)
+
+        # ── Step 2: Click the timeframe div (BMO uses <div role="button">) ───
+        if timeframe == "Custom" and custom_from and custom_to:
+            clicked = self._try_click(
+                selectors=[
+                    "div.duraton-list-item:has-text('Custom')",
+                    "[role='button']:has-text('Custom')",
+                ],
+                description="Custom timeframe",
+                timeout=5000
+            )
+            if not clicked:
+                logger.error("Could not click Custom timeframe")
+                return
+
+            self._pause(1)
+
+            # ── Step 3: Fill custom date inputs ──────────────────────────────
+            # NOTE: Provide HTML of the Custom date inputs
+            # so selectors below can be confirmed/updated
+            date_inputs = self.page.locator(
+                "input[type='date'], "
+                "input[placeholder*='MM'], "
+                "input[placeholder*='dd'], "
+                "input[aria-label*='date']"
+            ).all()
+
+            if len(date_inputs) >= 2:
+                date_inputs[0].fill(custom_from)
+                date_inputs[1].fill(custom_to)
+                logger.info(f"Custom: {custom_from} → {custom_to}")
+            else:
+                logger.error(
+                    f"Custom date inputs not found "
+                    f"(found {len(date_inputs)}). "
+                    f"Please provide HTML of the custom date fields."
+                )
+                return
+
+        else:
+            # ── Standard timeframe: Today / Last 7/14/30/60 days ─────────────
+            clicked = self._try_click(
+                selectors=[
+                    f"div.duraton-list-item:has-text('{timeframe}')",
+                    f"[role='button']:has-text('{timeframe}')",
+                    f"div:text-is('{timeframe}')",
+                ],
+                description=f"Timeframe: {timeframe}",
+                timeout=5000
+            )
+            if not clicked:
+                logger.warning(
+                    f"Timeframe '{timeframe}' not clicked - "
+                    "using portal default"
+                )
+
+        self._pause(0.8)
+
+        # ── Step 4: Apply filters ─────────────────────────────────────────────
+        self._try_click(
+            selectors=[
+                "button:has-text('Apply filters')",
+                "button:has-text('Apply')",
+            ],
+            description="Apply filters",
+            timeout=8000
+        )
+        self._pause(2)
+
+    def has_transactions(self) -> bool:
+        """Check if transactions exist after filter."""
+        try:
+            rows = self.page.locator(
+                "table tbody tr, "
+                "[class*='transaction-row'], "
+                "[class*='transaction'] tr"
+            ).count()
+            logger.info(f"Transaction rows: {rows}")
+            return rows > 0
+        except Exception as e:
+            logger.error(f"has_transactions error: {e}")
+            return False
+
+    # =========================================================================
+    # EXPORT
+    # =========================================================================
+    def export_csv(self, account_number: str,
+                   account_name: str) -> str | None:
+        """Export transactions as CSV and save."""
+        logger.info(f"Exporting: {account_number}")
+
+        try:
+            with self.page.expect_download(
+                timeout=DOWNLOAD_WAIT_SEC * 1000
+            ) as download_info:
+
+                self._try_click(
+                    ["button:has-text('Export')"],
+                    "Export button",
+                    timeout=8000
+                )
+                self._pause(1)
+
+                self._try_click(
+                    selectors=[
+                        "text=CSV",
+                        "label:has-text('CSV')",
+                        "input[type='radio'][value*='csv']",
+                        "input[type='radio'][value*='CSV']",
+                    ],
+                    description="CSV format",
+                    timeout=5000
+                )
+                self._pause(0.5)
+
+                self._try_click(
+                    selectors=[
+                        "button:has-text('Export')",
+                        "button:has-text('Download')",
+                        "button:has-text('Confirm')",
+                    ],
+                    description="Confirm export",
+                    timeout=5000
+                )
+
+            download  = download_info.value
+            safe_name = (
+                account_name
+                .replace(" ", "_")
+                .replace("/", "-")
+            )
+            today     = datetime.today().strftime("%Y%m%d")
+            filename  = (
+                f"BMO_{account_number}"
+                f"_{safe_name}_{today}.csv"
+            )
+            save_path = os.path.join(
+                self.download_folder, filename
+            )
+            download.save_as(save_path)
+            logger.info(f"Saved: {save_path}")
+            return save_path
+
+        except Exception as e:
+            logger.error(f"Export failed: {e}")
+            return None
+
+    # =========================================================================
+    # CLOSE MODAL
+    # =========================================================================
+    def close_modal(self):
+        """Close Account Details modal."""
+        logger.debug("Closing modal...")
+        clicked = self._try_click(
+            selectors=[
+                "button[aria-label='Close']",
+                "button[aria-label='close']",
+                "a:has-text('Back to all deposit accounts')",
+                "a:has-text('Back to all')",
+                "button:has-text('×')",
+            ],
+            description="Close modal",
+            timeout=5000
+        )
+
+        if not clicked:
+            self.page.keyboard.press("Escape")
+            logger.debug("Modal closed via Escape")
+
+        self._pause(1.5)
