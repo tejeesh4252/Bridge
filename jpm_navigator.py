@@ -7,6 +7,7 @@ import shutil
 import threading
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from config import DEFAULT_OUTPUT_FOLDER
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 JPM_LOGIN_URL = (
@@ -31,8 +32,9 @@ def get_report_date() -> datetime:
 
 
 def get_output_folder() -> str:
-    """Always saves to JPM_Reports/ in the current working directory."""
-    folder = os.path.join(os.getcwd(), "JPM_Reports")
+    """Saves to JPM_Reports/ under the shared SharePoint output root
+    (same root BMO writes to — see DEFAULT_OUTPUT_FOLDER in config.py)."""
+    folder = os.path.join(DEFAULT_OUTPUT_FOLDER, "JPM_Reports")
     os.makedirs(folder, exist_ok=True)
     return folder
 
