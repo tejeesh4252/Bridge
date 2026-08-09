@@ -29,6 +29,13 @@ from core.downloader import DownloadOrchestrator        # class-based BMO pipeli
 from core.account_loader import load_accounts           # BMO: pulls ALL active accounts
 from config import DEFAULT_TIMEFRAME, DEFAULT_OUTPUT_FOLDER
 
+# ── Initialize logging before anything else — same as main.py ────────────
+from core.logger_setup import setup_logging
+setup_logging()
+import logging
+logger = logging.getLogger("BridgeBMO.Main")
+logger.info("Unified JPM+BMO Extractor starting...")
+
 # ── Palette ────────────────────────────────────────────────────────────────
 INK        = "#0f172a"   # console background / primary text
 PANEL_BG   = "#f4f6f9"   # left "setup" panel background
